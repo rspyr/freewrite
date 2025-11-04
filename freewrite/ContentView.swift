@@ -10,6 +10,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import PDFKit
+import CoreText
 
 struct HumanEntry: Identifiable {
     let id: UUID
@@ -41,6 +42,12 @@ struct HeartEmoji: Identifiable {
     let id = UUID()
     var position: CGPoint
     var offset: CGFloat = 0
+}
+
+struct ImportedFontRecord: Codable, Hashable {
+    let fileName: String
+    let postScriptName: String
+    let displayName: String
 }
 
 struct ContentView: View {
@@ -85,6 +92,7 @@ struct ContentView: View {
     @State private var colorScheme: ColorScheme = .light // Add state for color scheme
     @State private var isHoveringThemeToggle = false // Add state for theme toggle hover
     @State private var didCopyPrompt: Bool = false // Add state for copy prompt feedback
+    @State private var importedFonts: [ImportedFontRecord] = []
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -107,10 +115,10 @@ struct ContentView: View {
     private let saveTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     
     // Add cached documents directory
-    private let documentsDirectory: URL = {
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Freewrite")
-        
-        // Create Freewrite directory if it doesn't exist
+    private static func applicationDocumentsDirectory() -> URL {
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Freewrite")
+
         if !FileManager.default.fileExists(atPath: directory.path) {
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -119,9 +127,98 @@ struct ContentView: View {
                 print("Error creating directory: \(error)")
             }
         }
-        
+
         return directory
-    }()
+    }
+
+    private static func fontsDirectoryURL() -> URL {
+        let fontsDirectory = applicationDocumentsDirectory().appendingPathComponent("Fonts", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: fontsDirectory.path) {
+            do {
+                try FileManager.default.createDirectory(at: fontsDirectory, withIntermediateDirectories: true)
+                print("Successfully created Fonts directory")
+            } catch {
+                print("Error creating Fonts directory: \(error)")
+            }
+        }
+        return fontsDirectory
+    }
+
+    private static func importedFontsListURL() -> URL {
+        fontsDirectoryURL().appendingPathComponent("imported_fonts.json")
+    }
+
+    private static func loadPersistedImportedFonts() -> [ImportedFontRecord] {
+        let fileURL = importedFontsListURL()
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            return []
+        }
+
+        do {
+            let data = try Data(contentsOf: fileURL)
+            let decoded = try JSONDecoder().decode([ImportedFontRecord].self, from: data)
+            let fontsDirectory = fontsDirectoryURL()
+            var seen = Set<String>()
+            let filtered = decoded.filter { record in
+                let exists = fileManager.fileExists(atPath: fontsDirectory.appendingPathComponent(record.fileName).path)
+                let isNew = seen.insert(record.postScriptName).inserted
+                return exists && isNew
+            }
+            if filtered.count != decoded.count {
+                saveImportedFontRecords(filtered)
+            }
+            return filtered
+        } catch {
+            print("Error loading persisted fonts: \(error)")
+            return []
+        }
+    }
+
+    private static func saveImportedFontRecords(_ records: [ImportedFontRecord]) {
+        let fileURL = importedFontsListURL()
+        do {
+            let data = try JSONEncoder().encode(records)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            print("Error saving imported fonts: \(error)")
+        }
+    }
+
+    private static func registerPersistedFonts(_ records: [ImportedFontRecord]) {
+        let fontsDirectory = fontsDirectoryURL()
+        let fileManager = FileManager.default
+        for record in records {
+            let fontURL = fontsDirectory.appendingPathComponent(record.fileName)
+            guard fileManager.fileExists(atPath: fontURL.path) else { continue }
+            registerFontFile(at: fontURL)
+        }
+    }
+
+    @discardableResult
+    private static func registerFontFile(at url: URL) -> Bool {
+        var registrationError: Unmanaged<CFError>?
+        let success = CTFontManagerRegisterFontsForURL(url as CFURL, .process, &registrationError)
+        if success {
+            return true
+        }
+
+        guard let error = registrationError?.takeRetainedValue() else {
+            return false
+        }
+
+        let nsError = error as NSError
+        let alreadyRegisteredCode = CTFontManagerError.alreadyRegistered.rawValue
+        if nsError.domain == (kCTFontManagerErrorDomain as String) && nsError.code == alreadyRegisteredCode {
+            return true
+        }
+
+        print("Error registering font at \(url.lastPathComponent): \(nsError)")
+        return false
+    }
+
+    private let documentsDirectory: URL = ContentView.applicationDocumentsDirectory()
+    private var fontsDirectory: URL { ContentView.fontsDirectoryURL() }
     
     // Add shared prompt constant
     private let aiChatPrompt = """
@@ -155,6 +252,10 @@ struct ContentView: View {
         // Load saved color scheme preference
         let savedScheme = UserDefaults.standard.string(forKey: "colorScheme") ?? "light"
         _colorScheme = State(initialValue: savedScheme == "dark" ? .dark : .light)
+
+        let persistedFonts = ContentView.loadPersistedImportedFonts()
+        ContentView.registerPersistedFonts(persistedFonts)
+        _importedFonts = State(initialValue: persistedFonts)
     }
     
     // Modify getDocumentsDirectory to use cached value
@@ -182,7 +283,7 @@ struct ContentView: View {
     private func loadText() {
         let documentsDirectory = getDocumentsDirectory()
         let fileURL = documentsDirectory.appendingPathComponent("entry.md")
-        
+
         print("Attempting to load file from: \(fileURL.path)")
         
         do {
@@ -196,6 +297,133 @@ struct ContentView: View {
             print("Error loading file: \(error)")
             print("Error details: \(error.localizedDescription)")
         }
+    }
+
+    private func importFont() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        if #available(macOS 11.0, *) {
+            var types: [UTType] = []
+            if let ttf = UTType(filenameExtension: "ttf") {
+                types.append(ttf)
+            }
+            if let otf = UTType(filenameExtension: "otf") {
+                types.append(otf)
+            }
+            if !types.isEmpty {
+                panel.allowedContentTypes = types
+            }
+        } else {
+            panel.allowedFileTypes = ["ttf", "otf"]
+        }
+
+        panel.title = "Import Fonts"
+        panel.prompt = "Import"
+
+        if panel.runModal() == .OK {
+            panel.urls.forEach { processImportedFont(from: $0) }
+        }
+    }
+
+    private func processImportedFont(from sourceURL: URL) {
+        let destinationURL = uniqueDestinationURL(for: sourceURL, in: fontsDirectory)
+
+        do {
+            try fileManager.copyItem(at: sourceURL, to: destinationURL)
+
+            let records = fontRecords(forFontAt: destinationURL)
+
+            guard !records.isEmpty else {
+                try? fileManager.removeItem(at: destinationURL)
+                return
+            }
+
+            guard ContentView.registerFontFile(at: destinationURL) else {
+                try? fileManager.removeItem(at: destinationURL)
+                return
+            }
+
+            let newRecords = storeImportedFontRecords(records)
+
+            guard !newRecords.isEmpty else {
+                try? fileManager.removeItem(at: destinationURL)
+                return
+            }
+
+            if let last = newRecords.last {
+                selectedFont = last.postScriptName
+                currentRandomFont = ""
+            }
+        } catch {
+            print("Error importing font: \(error)")
+            try? fileManager.removeItem(at: destinationURL)
+        }
+    }
+
+    private func fontRecords(forFontAt url: URL) -> [ImportedFontRecord] {
+        guard let descriptors = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor] else {
+            return []
+        }
+
+        return descriptors.compactMap { descriptor in
+            guard let postScriptName = CTFontDescriptorCopyAttribute(descriptor, kCTFontNameAttribute) as? String else {
+                return nil
+            }
+
+            let displayName = (
+                CTFontDescriptorCopyAttribute(descriptor, kCTFontDisplayNameAttribute) as? String
+            ) ?? (
+                CTFontDescriptorCopyAttribute(descriptor, kCTFontFamilyNameAttribute) as? String
+            ) ?? postScriptName
+
+            return ImportedFontRecord(
+                fileName: url.lastPathComponent,
+                postScriptName: postScriptName,
+                displayName: displayName
+            )
+        }
+    }
+
+    private func uniqueDestinationURL(for sourceURL: URL, in directory: URL) -> URL {
+        let baseName = sourceURL.deletingPathExtension().lastPathComponent
+        let ext = sourceURL.pathExtension
+        var candidate = directory.appendingPathComponent(sourceURL.lastPathComponent)
+        var index = 1
+
+        while fileManager.fileExists(atPath: candidate.path) {
+            var newURL = directory.appendingPathComponent("\(baseName)-\(index)")
+            if !ext.isEmpty {
+                newURL = newURL.appendingPathExtension(ext)
+            }
+            candidate = newURL
+            index += 1
+        }
+
+        return candidate
+    }
+
+    @discardableResult
+    private func storeImportedFontRecords(_ records: [ImportedFontRecord]) -> [ImportedFontRecord] {
+        guard !records.isEmpty else { return [] }
+
+        var updated = importedFonts
+        var added: [ImportedFontRecord] = []
+
+        for record in records {
+            if !updated.contains(where: { $0.postScriptName == record.postScriptName }) {
+                updated.append(record)
+                added.append(record)
+            }
+        }
+
+        if !added.isEmpty {
+            importedFonts = updated
+            ContentView.saveImportedFontRecords(updated)
+        }
+
+        return added
     }
     
     // Add function to load existing entries
@@ -487,10 +715,10 @@ struct ContentView: View {
                                     NSCursor.pop()
                                 }
                             }
-                            
+
                             Text("•")
                                 .foregroundColor(.gray)
-                            
+
                             Button("Arial") {
                                 selectedFont = "Arial"
                                 currentRandomFont = ""
@@ -506,10 +734,10 @@ struct ContentView: View {
                                     NSCursor.pop()
                                 }
                             }
-                            
+
                             Text("•")
                                 .foregroundColor(.gray)
-                            
+
                             Button("System") {
                                 selectedFont = ".AppleSystemUIFont"
                                 currentRandomFont = ""
@@ -525,10 +753,10 @@ struct ContentView: View {
                                     NSCursor.pop()
                                 }
                             }
-                            
+
                             Text("•")
                                 .foregroundColor(.gray)
-                            
+
                             Button("Serif") {
                                 selectedFont = "Times New Roman"
                                 currentRandomFont = ""
@@ -544,10 +772,38 @@ struct ContentView: View {
                                     NSCursor.pop()
                                 }
                             }
-                            
+
+                            if !importedFonts.isEmpty {
+                                Text("•")
+                                    .foregroundColor(.gray)
+
+                                ForEach(Array(importedFonts.enumerated()), id: \.element.postScriptName) { index, font in
+                                    Button(font.displayName) {
+                                        selectedFont = font.postScriptName
+                                        currentRandomFont = ""
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundColor(hoveredFont == font.postScriptName ? textHoverColor : textColor)
+                                    .onHover { hovering in
+                                        hoveredFont = hovering ? font.postScriptName : nil
+                                        isHoveringBottomNav = hovering
+                                        if hovering {
+                                            NSCursor.pointingHand.push()
+                                        } else {
+                                            NSCursor.pop()
+                                        }
+                                    }
+
+                                    if index < importedFonts.count - 1 {
+                                        Text("•")
+                                            .foregroundColor(.gray)
+                                    }
+                                }
+                            }
+
                             Text("•")
                                 .foregroundColor(.gray)
-                            
+
                             Button(randomButtonTitle) {
                                 if let randomFont = availableFonts.randomElement() {
                                     selectedFont = randomFont
@@ -558,6 +814,24 @@ struct ContentView: View {
                             .foregroundColor(hoveredFont == "Random" ? textHoverColor : textColor)
                             .onHover { hovering in
                                 hoveredFont = hovering ? "Random" : nil
+                                isHoveringBottomNav = hovering
+                                if hovering {
+                                    NSCursor.pointingHand.push()
+                                } else {
+                                    NSCursor.pop()
+                                }
+                            }
+
+                            Text("•")
+                                .foregroundColor(.gray)
+
+                            Button("Import Font…") {
+                                importFont()
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(hoveredFont == "ImportFont" ? textHoverColor : textColor)
+                            .onHover { hovering in
+                                hoveredFont = hovering ? "ImportFont" : nil
                                 isHoveringBottomNav = hovering
                                 if hovering {
                                     NSCursor.pointingHand.push()
