@@ -43,11 +43,32 @@ struct HeartEmoji: Identifiable {
     var offset: CGFloat = 0
 }
 
+private struct FontPreferences {
+    private static let pinnedKey = "pinnedFonts"
+    private static let importedKey = "importedFonts"
+
+    static func loadPinnedFonts() -> [String] {
+        UserDefaults.standard.stringArray(forKey: pinnedKey) ?? []
+    }
+
+    static func savePinnedFonts(_ fonts: [String]) {
+        UserDefaults.standard.set(fonts, forKey: pinnedKey)
+    }
+
+    static func loadImportedFonts() -> [String] {
+        UserDefaults.standard.stringArray(forKey: importedKey) ?? []
+    }
+
+    static func saveImportedFonts(_ fonts: [String]) {
+        UserDefaults.standard.set(fonts, forKey: importedKey)
+    }
+}
+
 struct ContentView: View {
     private let headerString = "\n\n"
     @State private var entries: [HumanEntry] = []
     @State private var text: String = ""  // Remove initial welcome text since we'll handle it in createNewEntry
-    
+
     @State private var isFullscreen = false
     @State private var selectedFont: String = "Lato-Regular"
     @State private var currentRandomFont: String = ""
@@ -85,11 +106,22 @@ struct ContentView: View {
     @State private var colorScheme: ColorScheme = .light // Add state for color scheme
     @State private var isHoveringThemeToggle = false // Add state for theme toggle hover
     @State private var didCopyPrompt: Bool = false // Add state for copy prompt feedback
+    @State private var isHoveringPinButton = false
+    @State private var pinnedFonts: [String] = []
+    @State private var importedFonts: [String] = []
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
-    
+
     let availableFonts = NSFontManager.shared.availableFontFamilies
-    let standardFonts = ["Lato-Regular", "Arial", ".AppleSystemUIFont", "Times New Roman"]
+    let defaultFontOptions: [(label: String, fontName: String)] = [
+        ("Lato", "Lato-Regular"),
+        ("Arial", "Arial"),
+        ("System", ".AppleSystemUIFont"),
+        ("Serif", "Times New Roman")
+    ]
+    var standardFonts: [String] {
+        defaultFontOptions.map { $0.fontName }
+    }
     let fontSizes: [CGFloat] = [16, 18, 20, 22, 24, 26]
     let placeholderOptions = [
         "\n\nBegin writing",
@@ -155,6 +187,8 @@ struct ContentView: View {
         // Load saved color scheme preference
         let savedScheme = UserDefaults.standard.string(forKey: "colorScheme") ?? "light"
         _colorScheme = State(initialValue: savedScheme == "dark" ? .dark : .light)
+        _pinnedFonts = State(initialValue: FontPreferences.loadPinnedFonts())
+        _importedFonts = State(initialValue: FontPreferences.loadImportedFonts())
     }
     
     // Modify getDocumentsDirectory to use cached value
@@ -381,9 +415,140 @@ struct ContentView: View {
     var popoverTextColor: Color {
         return colorScheme == .light ? Color.primary : Color.white
     }
-    
+
     @State private var viewHeight: CGFloat = 0
-    
+
+    @ViewBuilder
+    private func fontSelectionControls(textColor: Color, textHoverColor: Color) -> some View {
+        separatorDot()
+
+        let pinnedOptions = pinnedFonts.map { (label: displayName(for: $0), fontName: $0) }
+        let defaultOptions = defaultFontOptions.filter { !pinnedFonts.contains($0.fontName) }
+        let importedOptions = importedFonts
+            .filter { !pinnedFonts.contains($0) && !standardFonts.contains($0) }
+            .map { (label: displayName(for: $0), fontName: $0) }
+
+        let fontOptions = pinnedOptions + defaultOptions + importedOptions
+
+        let enumeratedOptions = Array(fontOptions.enumerated())
+        ForEach(enumeratedOptions, id: \.offset) { enumerated in
+            let option = enumerated.element
+            let index = enumerated.offset
+            fontButton(label: option.label, fontName: option.fontName, textColor: textColor, textHoverColor: textHoverColor)
+            if index < fontOptions.count - 1 {
+                separatorDot()
+            }
+        }
+
+        if !fontOptions.isEmpty {
+            separatorDot()
+        }
+
+        Button(randomButtonTitle) {
+            if let randomFont = availableFonts.randomElement() {
+                selectFont(randomFont, isRandom: true)
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(hoveredFont == "Random" ? textHoverColor : textColor)
+        .onHover { hovering in
+            hoveredFont = hovering ? "Random" : nil
+            isHoveringBottomNav = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+
+        separatorDot()
+
+        Button {
+            togglePin(for: selectedFont)
+        } label: {
+            Image(systemName: isFontPinned(selectedFont) ? "pin.fill" : "pin")
+                .foregroundColor(isHoveringPinButton ? textHoverColor : textColor)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHoveringPinButton = hovering
+            isHoveringBottomNav = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .help(isFontPinned(selectedFont) ? "Unpin current font" : "Pin current font")
+    }
+
+    @ViewBuilder
+    private func separatorDot() -> some View {
+        Text("•")
+            .foregroundColor(.gray)
+    }
+
+    @ViewBuilder
+    private func fontButton(label: String, fontName: String, textColor: Color, textHoverColor: Color) -> some View {
+        Button(label) {
+            selectFont(fontName)
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(hoveredFont == fontName ? textHoverColor : textColor)
+        .onHover { hovering in
+            hoveredFont = hovering ? fontName : nil
+            isHoveringBottomNav = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .contextMenu {
+            Button(isFontPinned(fontName) ? "Unpin" : "Pin") {
+                togglePin(for: fontName)
+            }
+        }
+    }
+
+    private func selectFont(_ fontName: String, isRandom: Bool = false) {
+        selectedFont = fontName
+        currentRandomFont = isRandom ? fontName : ""
+    }
+
+    private func isFontPinned(_ fontName: String) -> Bool {
+        pinnedFonts.contains(fontName)
+    }
+
+    private func togglePin(for fontName: String) {
+        guard !fontName.isEmpty else { return }
+        if let index = pinnedFonts.firstIndex(of: fontName) {
+            pinnedFonts.remove(at: index)
+        } else {
+            pinnedFonts.insert(fontName, at: 0)
+            if let importedIndex = importedFonts.firstIndex(of: fontName) {
+                importedFonts.remove(at: importedIndex)
+            }
+        }
+    }
+
+    private func displayName(for fontName: String) -> String {
+        if let defaultOption = defaultFontOptions.first(where: { $0.fontName == fontName }) {
+            return defaultOption.label
+        }
+        if fontName == ".AppleSystemUIFont" {
+            return "System"
+        }
+        return fontName.replacingOccurrences(of: "-", with: " ")
+    }
+
+    private func handleSelectedFontChange(_ fontName: String) {
+        guard !fontName.isEmpty else { return }
+        if !standardFonts.contains(fontName) && !pinnedFonts.contains(fontName) && !importedFonts.contains(fontName) {
+            importedFonts.append(fontName)
+        }
+    }
+
     var body: some View {
         let buttonBackground = colorScheme == .light ? Color.white : Color.black
         let navHeight: CGFloat = 68
@@ -468,103 +633,8 @@ struct ContentView: View {
                                     NSCursor.pop()
                                 }
                             }
-                            
-                            Text("•")
-                                .foregroundColor(.gray)
-                            
-                            Button("Lato") {
-                                selectedFont = "Lato-Regular"
-                                currentRandomFont = ""
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundColor(hoveredFont == "Lato" ? textHoverColor : textColor)
-                            .onHover { hovering in
-                                hoveredFont = hovering ? "Lato" : nil
-                                isHoveringBottomNav = hovering
-                                if hovering {
-                                    NSCursor.pointingHand.push()
-                                } else {
-                                    NSCursor.pop()
-                                }
-                            }
-                            
-                            Text("•")
-                                .foregroundColor(.gray)
-                            
-                            Button("Arial") {
-                                selectedFont = "Arial"
-                                currentRandomFont = ""
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundColor(hoveredFont == "Arial" ? textHoverColor : textColor)
-                            .onHover { hovering in
-                                hoveredFont = hovering ? "Arial" : nil
-                                isHoveringBottomNav = hovering
-                                if hovering {
-                                    NSCursor.pointingHand.push()
-                                } else {
-                                    NSCursor.pop()
-                                }
-                            }
-                            
-                            Text("•")
-                                .foregroundColor(.gray)
-                            
-                            Button("System") {
-                                selectedFont = ".AppleSystemUIFont"
-                                currentRandomFont = ""
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundColor(hoveredFont == "System" ? textHoverColor : textColor)
-                            .onHover { hovering in
-                                hoveredFont = hovering ? "System" : nil
-                                isHoveringBottomNav = hovering
-                                if hovering {
-                                    NSCursor.pointingHand.push()
-                                } else {
-                                    NSCursor.pop()
-                                }
-                            }
-                            
-                            Text("•")
-                                .foregroundColor(.gray)
-                            
-                            Button("Serif") {
-                                selectedFont = "Times New Roman"
-                                currentRandomFont = ""
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundColor(hoveredFont == "Serif" ? textHoverColor : textColor)
-                            .onHover { hovering in
-                                hoveredFont = hovering ? "Serif" : nil
-                                isHoveringBottomNav = hovering
-                                if hovering {
-                                    NSCursor.pointingHand.push()
-                                } else {
-                                    NSCursor.pop()
-                                }
-                            }
-                            
-                            Text("•")
-                                .foregroundColor(.gray)
-                            
-                            Button(randomButtonTitle) {
-                                if let randomFont = availableFonts.randomElement() {
-                                    selectedFont = randomFont
-                                    currentRandomFont = randomFont
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundColor(hoveredFont == "Random" ? textHoverColor : textColor)
-                            .onHover { hovering in
-                                hoveredFont = hovering ? "Random" : nil
-                                isHoveringBottomNav = hovering
-                                if hovering {
-                                    NSCursor.pointingHand.push()
-                                } else {
-                                    NSCursor.pop()
-                                }
-                            }
+
+                            fontSelectionControls(textColor: textColor, textHoverColor: textHoverColor)
                         }
                         .padding(8)
                         .cornerRadius(6)
@@ -1064,6 +1134,15 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
             isFullscreen = false
+        }
+        .onChange(of: selectedFont) { newValue in
+            handleSelectedFontChange(newValue)
+        }
+        .onChange(of: pinnedFonts) { newValue in
+            FontPreferences.savePinnedFonts(newValue)
+        }
+        .onChange(of: importedFonts) { newValue in
+            FontPreferences.saveImportedFonts(newValue)
         }
     }
     
